@@ -9,12 +9,12 @@ from typing import Callable, Literal, cast
 
 from typing_extensions import Unpack
 
-from inspect_ai._display import display
-from inspect_ai._display._display import (
+from inspect_ai._display import (
     TaskCancelled,
     TaskError,
     TaskProfile,
     TaskSuccess,
+    display,
 )
 from inspect_ai._util.constants import (
     DEFAULT_EPOCHS,
@@ -28,6 +28,7 @@ from inspect_ai._util.registry import (
     is_registry_object,
     registry_log_name,
 )
+from inspect_ai._util.timeouts import Timeout, timeout, timeout_at
 from inspect_ai._view.notify import view_notify_eval
 from inspect_ai.dataset import Dataset, Sample
 from inspect_ai.log import (
@@ -40,10 +41,12 @@ from inspect_ai.log import (
 )
 from inspect_ai.log._condense import condense_sample
 from inspect_ai.log._file import eval_log_json
-from inspect_ai.log._log import EvalSampleReductions, eval_error
+from inspect_ai.log._log import EvalSampleLimit, EvalSampleReductions, eval_error
+from inspect_ai.log._samples import active_sample
 from inspect_ai.log._transcript import (
     ErrorEvent,
     SampleInitEvent,
+    SampleLimitEvent,
     ScoreEvent,
     transcript,
 )
@@ -64,7 +67,7 @@ from inspect_ai.solver import Generate, Plan, TaskState
 from inspect_ai.solver._chain import Chain, unroll
 from inspect_ai.solver._fork import set_task_generate
 from inspect_ai.solver._solver import Solver
-from inspect_ai.solver._task_state import set_sample_state, state_jsonable
+from inspect_ai.solver._task_state import sample_state, set_sample_state, state_jsonable
 from inspect_ai.util._sandbox.environment import SandboxEnvironmentSpec
 from inspect_ai.util._subtask import init_subtask
 
@@ -82,7 +85,7 @@ from .log import TaskLogger, collect_eval_data, log_start
 from .results import eval_results
 from .rundir import set_task_run_dir
 from .sandbox import sandboxenv_context
-from .util import sample_messages, task_run_dir
+from .util import sample_messages, slice_dataset, task_run_dir
 
 py_logger = getLogger(__name__)
 
@@ -103,7 +106,6 @@ class TaskRunOptions:
     score: bool = field(default=True)
     debug_errors: bool = field(default=False)
     sample_source: EvalSampleSource | None = field(default=None)
-    sample_semaphore: asyncio.Semaphore | None = field(default=None)
     kwargs: GenerateConfigArgs = field(default_factory=lambda: GenerateConfigArgs())
 
 
@@ -119,7 +121,6 @@ async def task_run(options: TaskRunOptions) -> EvalLog:
     tags = options.tags
     score = options.score
     sample_source = options.sample_source
-    sample_semaphore = options.sample_semaphore
     kwargs = options.kwargs
 
     # resolve default generate_config for task
@@ -146,7 +147,7 @@ async def task_run(options: TaskRunOptions) -> EvalLog:
         model_name = ModelName(model)
         epochs = config.epochs if config.epochs else DEFAULT_EPOCHS
         sandbox_cleanup = config.sandbox_cleanup is not False
-        log_images = config.log_images is True
+        log_images = config.log_images is not False
         log_samples = config.log_samples is not False
 
         # resolve dataset
@@ -238,10 +239,8 @@ async def task_run(options: TaskRunOptions) -> EvalLog:
                     set_task_generate(generate)
 
                     # semaphore to limit concurrency
-                    sample_semaphore = (
-                        sample_semaphore
-                        if sample_semaphore
-                        else create_sample_semaphore(config, generate_config, model.api)
+                    sample_semaphore = create_sample_semaphore(
+                        config, generate_config, model.api
                     )
 
                     # create sample coroutines
@@ -260,6 +259,11 @@ async def task_run(options: TaskRunOptions) -> EvalLog:
                             log_images=log_images,
                             sample_source=sample_source,
                             sample_error=sample_error_handler,
+                            fails_on_error=(
+                                config.fail_on_error is None
+                                or config.fail_on_error is True
+                            ),
+                            time_limit=config.time_limit,
                             semaphore=sample_semaphore,
                         )
                         for (sample, state) in zip(samples, states)
@@ -363,6 +367,8 @@ async def task_run_sample(
     log_images: bool,
     sample_source: EvalSampleSource | None,
     sample_error: Callable[[BaseException], EvalError],
+    fails_on_error: bool,
+    time_limit: int | None,
     semaphore: asyncio.Semaphore | None,
 ) -> dict[str, SampleScore] | None:
     # if there is an existing sample then tick off its progress, log it, and return it
@@ -399,7 +405,7 @@ async def task_run_sample(
     # initialise subtask and scoring context
     init_sample_model_usage()
     set_sample_state(state)
-    init_subtask(SAMPLE_SUBTASK, state.store)
+    sample_transcript = init_subtask(SAMPLE_SUBTASK, state.store)
     if scorers:
         init_scoring_context(scorers, Target(sample.target))
 
@@ -410,56 +416,152 @@ async def task_run_sample(
         else contextlib.nullcontext()
     )
 
+    # use timeout if provided
+    timeout_cm = (
+        timeout(time_limit) if time_limit is not None else contextlib.nullcontext()
+    )
+
+    # helper to handle exceptions (will throw if we've exceeded the limit)
+    def handle_error(ex: BaseException) -> EvalError:
+        err = sample_error(ex)
+        transcript()._event(ErrorEvent(error=err))
+        return err
+
     # solver loop
-    async with semaphore_cm, sandboxenv_cm:
+    async with (
+        semaphore_cm,
+        sandboxenv_cm,
+        active_sample(
+            task=task_name,
+            model=str(state.model),
+            sample=sample,
+            epoch=state.epoch,
+            fails_on_error=fails_on_error,
+            transcript=sample_transcript,
+        ) as active,
+    ):
         error: EvalError | None = None
         try:
-            # sample init event (remove file bodies as they have content or absolute paths)
-            event_sample = sample.model_copy(
-                update=dict(files={k: "" for k in sample.files.keys()})
-                if sample.files
-                else None
-            )
+            async with timeout_cm:
+                # sample init event (remove file bodies as they have content or absolute paths)
+                event_sample = sample.model_copy(
+                    update=dict(files={k: "" for k in sample.files.keys()})
+                    if sample.files
+                    else None
+                )
+                transcript()._event(
+                    SampleInitEvent(sample=event_sample, state=state_jsonable(state))
+                )
+
+                # set progress for plan then run it
+                plan.progress = progress
+                state = await plan(state, generate)
+
+        except TimeoutError:
+            # notify the user
             transcript()._event(
-                SampleInitEvent(sample=event_sample, state=state_jsonable(state))
+                SampleLimitEvent(
+                    type="time",
+                    message=f"Sample completed: exceeded time limit ({time_limit:,} seconds)",
+                    limit=time_limit,
+                )
             )
 
-            # set progress for plan then run it
-            plan.progress = progress
-            state = await plan(state, generate)
+            # capture most recent state for scoring
+            state = sample_state() or state
+
+        except asyncio.CancelledError as ex:
+            if active.interrupt_action:
+                # record eve t
+                transcript()._event(
+                    SampleLimitEvent(
+                        type="operator",
+                        message="Sample completed: interrupted by operator",
+                    )
+                )
+
+                # handle the action
+                match active.interrupt_action:
+                    case "score":
+                        # continue to scoring (capture the most recent state)
+                        state = sample_state() or state
+                    case "error":
+                        # default error handling
+                        error = handle_error(ex)
+
+            else:
+                raise
+
+        except BaseException as ex:
+            error = handle_error(ex)
+
+        # set timeout for scoring. if the original timeout was never hit
+        # then just create a new timeout_cm targeting the original
+        # timeout time. if the original timeout was hit we still want
+        # to provide an opportunity for scoring, but we don't necessarily
+        # want to wait the full timeout again (especially in the case where
+        # the cause of the timeout is a hung container and scoring requires
+        # interacting with the container). as a middle ground we use half
+        # of the original timeout value for scoring.
+        if isinstance(timeout_cm, Timeout):
+            if not timeout_cm.expired():
+                timeout_cm = timeout_at(timeout_cm.when())
+            else:
+                assert time_limit
+                timeout_cm = timeout(time_limit / 2)
+
+        # scoring
+        try:
+            # timeout during scoring will result in an ordinary sample error
+            async with timeout_cm:
+                results: dict[str, SampleScore] = {}
+                if scorers and error is None:
+                    for scorer in scorers:
+                        scorer_name = unique_scorer_name(scorer, list(results.keys()))
+                        with transcript().step(name=scorer_name, type="scorer"):
+                            score_result = (
+                                await scorer(state, Target(sample.target))
+                                if scorer
+                                else None
+                            )
+                            if score_result is not None:
+                                sample_score = SampleScore(
+                                    sample_id=sample.id,
+                                    value=score_result.value,
+                                    answer=score_result.answer,
+                                    explanation=score_result.explanation,
+                                    metadata=score_result.metadata,
+                                )
+                                transcript()._event(
+                                    ScoreEvent(score=score_result, target=sample.target)
+                                )
+                                results[scorer_name] = sample_score
 
         except asyncio.CancelledError:
-            # allow cancelled error to propagate
+            if active.interrupt_action:
+                transcript()._event(
+                    SampleLimitEvent(
+                        type="operator",
+                        message="Unable to score sample due to operator interruption",
+                    )
+                )
+
             raise
 
         except BaseException as ex:
-            # handle error (this will throw if we've exceeded the limit)
-            error = sample_error(ex)
-
-            # fire error event
-            transcript()._event(ErrorEvent(error=error))
-
-        # score it
-        results: dict[str, SampleScore] = {}
-        if scorers and error is None:
-            for scorer in scorers:
-                scorer_name = unique_scorer_name(scorer, list(results.keys()))
-                with transcript().step(name=scorer_name, type="scorer"):
-                    score_result = (
-                        await scorer(state, Target(sample.target)) if scorer else None
+            # note timeout
+            if isinstance(ex, TimeoutError):
+                transcript()._event(
+                    SampleLimitEvent(
+                        type="time",
+                        message=f"Unable to score sample due to exceeded time limit ({time_limit:,} seconds)",
+                        limit=time_limit,
                     )
-                    if score_result is not None:
-                        sample_score = SampleScore(
-                            sample_id=sample.id,
-                            value=score_result.value,
-                            answer=score_result.answer,
-                            explanation=score_result.explanation,
-                            metadata=score_result.metadata,
-                        )
-                        transcript()._event(
-                            ScoreEvent(score=score_result, target=sample.target)
-                        )
-                        results[scorer_name] = sample_score
+                )
+
+            # handle error (this will throw if we've exceeded the limit)
+            error = handle_error(ex)
+
         progress()
 
         # log it
@@ -506,6 +608,16 @@ def log_sample(
         )
 
     # construct sample for logging
+
+    # if a limit was hit, note that in the Eval Sample
+    limit = None
+    for e in transcript().events:
+        if e.event == "sample_limit":
+            limit = EvalSampleLimit(
+                type=e.type, limit=e.limit if e.limit is not None else -1
+            )
+            break
+
     eval_sample = EvalSample(
         id=id,
         epoch=state.epoch,
@@ -520,9 +632,10 @@ def log_sample(
         output=state.output,
         scores=cast(dict[str, Score], scores),
         store=dict(state.store.items()),
-        events=transcript().events,
+        events=list(transcript().events),
         model_usage=sample_model_usage(),
         error=error,
+        limit=limit,
     )
 
     logger.log_sample(condense_sample(eval_sample, log_images), flush=True)
@@ -538,12 +651,7 @@ async def resolve_dataset(
     token_limit: int | None,
 ) -> tuple[Dataset, list[Sample], list[TaskState]]:
     # apply limit to dataset
-    dataset_limit = (
-        slice(0, len(dataset))
-        if limit is None
-        else (slice(*limit) if isinstance(limit, tuple) else slice(0, limit))
-    )
-    dataset = dataset[dataset_limit]
+    dataset = slice_dataset(dataset, limit)
 
     # apply epochs (deepcopy the samples so they remain independent)
     samples: list[Sample] = []

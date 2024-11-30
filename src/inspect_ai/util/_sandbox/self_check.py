@@ -1,6 +1,13 @@
 from typing import Any, Callable, Coroutine, Generic, Optional, Type, TypeVar
+from unittest import mock
 
-from inspect_ai.util import SandboxEnvironment
+import pytest
+
+from inspect_ai.util import (
+    OutputLimitExceededError,
+    SandboxEnvironment,
+    SandboxEnvironmentLimits,
+)
 
 
 async def check_test_fn(
@@ -32,10 +39,12 @@ async def self_check(sandbox_env: SandboxEnvironment) -> dict[str, bool | str]:
         test_read_file_not_allowed,
         test_read_file_is_directory,
         test_read_file_nonsense_name,
+        test_read_file_limit,
         test_write_file_zero_length,
         test_write_file_space,
         test_write_file_is_directory,
         test_write_file_without_permissions,
+        test_write_file_exists,
         test_exec_output,
         test_exec_timeout,
         test_exec_permission_error,
@@ -45,6 +54,8 @@ async def self_check(sandbox_env: SandboxEnvironment) -> dict[str, bool | str]:
         test_cwd_custom,
         test_cwd_relative,
         test_cwd_absolute,
+        test_exec_stdout_is_limited,
+        test_exec_stderr_is_limited,
     ]:
         results[fn.__name__] = await check_test_fn(fn, sandbox_env)
 
@@ -141,6 +152,17 @@ async def test_read_file_nonsense_name(
     assert "wikipedia" in str(e_info.value)
 
 
+async def test_read_file_limit(sandbox_env: SandboxEnvironment) -> None:
+    file_name = "large.file"
+    await sandbox_env.write_file(file_name, "a" * 2048)  # 2 KiB
+    # Patch limit down to 1KiB for the test to save us from writing a 100 MiB file.
+    with mock.patch.object(SandboxEnvironmentLimits, "MAX_READ_FILE_SIZE", 1024):
+        with Raises(OutputLimitExceededError) as e_info:
+            await sandbox_env.read_file("large.file", text=True)
+        assert "limit of 100 MiB was exceeded" in str(e_info.value)
+    await _cleanup_file(sandbox_env, file_name)
+
+
 async def test_write_file_zero_length(sandbox_env: SandboxEnvironment) -> None:
     await sandbox_env.write_file("zero_length_file.file", "")
     zero_length = await sandbox_env.read_file("zero_length_file.file", text=True)
@@ -180,6 +202,16 @@ async def test_write_file_without_permissions(
     with Raises(PermissionError) as e_info:
         await sandbox_env.write_file(file_name, "this won't stick")
     assert file_name in str(e_info.value)
+
+
+async def test_write_file_exists(
+    sandbox_env: SandboxEnvironment,
+) -> None:
+    file_name = "file_exists.file"
+    await sandbox_env.write_file(file_name, "mundane content")
+    await sandbox_env.write_file(file_name, "altered content")
+    altered_content = await sandbox_env.read_file(file_name, text=True)
+    assert altered_content == "altered content"
 
 
 async def test_exec_output(sandbox_env: SandboxEnvironment) -> None:
@@ -270,6 +302,25 @@ async def test_cwd_absolute(sandbox_env: SandboxEnvironment) -> None:
     current_dir_contents = (await sandbox_env.exec(["ls"], cwd=cwd_directory)).stdout
     assert "test_cwd_absolute.file" in current_dir_contents
     await _cleanup_file(sandbox_env, file_name)
+
+
+async def test_exec_stdout_is_limited(sandbox_env: SandboxEnvironment) -> None:
+    output_size = 10 * 1024**2 + 1024  # 10 MiB + 1 KiB
+    with pytest.raises(OutputLimitExceededError) as e_info:
+        await sandbox_env.exec(["sh", "-c", f"yes | head -c {output_size}"])
+    assert "limit of 10 MiB was exceeded" in str(e_info.value)
+    truncated_output = e_info.value.truncated_output
+    # `yes` outputs 'y\n' (ASCII) so the size equals the string length.
+    assert truncated_output and len(truncated_output) == 10 * 1024**2
+
+
+async def test_exec_stderr_is_limited(sandbox_env: SandboxEnvironment) -> None:
+    output_size = 10 * 1024**2 + 1024  # 10 MiB + 1 KiB
+    with pytest.raises(OutputLimitExceededError) as e_info:
+        await sandbox_env.exec(["sh", "-c", f"yes | head -c {output_size} 1>&2"])
+    assert "limit of 10 MiB was exceeded" in str(e_info.value)
+    truncated_output = e_info.value.truncated_output
+    assert truncated_output and len(truncated_output) == 10 * 1024**2
 
 
 # TODO: write a test for when cwd doesn't exist

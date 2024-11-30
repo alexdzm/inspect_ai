@@ -2,6 +2,8 @@ import abc
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Literal, NamedTuple, Union, overload
 
+from pydantic import BaseModel, Field
+
 from .._subprocess import ExecResult
 
 TaskInit = Callable[[str, str | None], Awaitable[None]]
@@ -13,6 +15,40 @@ SampleInit = Callable[
 SampleCleanup = Callable[
     [str, str | None, dict[str, "SandboxEnvironment"], bool], Awaitable[None]
 ]
+
+
+class SandboxConnectionBase(BaseModel):
+    command: str
+    """Shell command to connect to sandbox."""
+
+    working_dir: str
+    """Agent working directory."""
+
+
+class SandboxConnectionLocal(SandboxConnectionBase):
+    type: Literal["local"] = Field(default="local")
+
+
+class SandboxConnectionContainer(SandboxConnectionBase):
+    type: Literal["container"] = Field(default="container")
+    """Sandbox login type."""
+
+    container: str
+    """Container name."""
+
+
+class SandboxConnectionSSH(SandboxConnectionBase):
+    type: Literal["ssh"] = Field(default="ssh")
+    """Sandbox login type."""
+
+    destination: str
+    """SSH destination server."""
+
+
+SandboxConnection = Union[
+    SandboxConnectionContainer, SandboxConnectionLocal, SandboxConnectionSSH
+]
+"""Information required to connect to sandbox."""
 
 
 class SandboxEnvironment(abc.ABC):
@@ -49,7 +85,9 @@ class SandboxEnvironment(abc.ABC):
           metadata (dict[str,str]): Sample `metadata` field
 
         Returns:
-          Dictionary of named sandbox environments.
+          Dictionary of named sandbox environments. The environment which represents
+          the default environment (resolved by `sandbox("default")` or `sandbox()`) must
+          be the first key/value pair in the dictionary.
         """
         return {}
 
@@ -110,6 +148,9 @@ class SandboxEnvironment(abc.ABC):
         The current working directory for execution will be the per-sample
         filesystem context.
 
+        Each output stream (stdout and stderr) is limited to 1 MiB. If exceeded, an
+        `OutputLimitExceededError` will be raised.
+
         Args:
           cmd (str | list[str]): Command or command and arguments to execute.
           input (str | bytes | None): Standard input (optional).
@@ -127,6 +168,8 @@ class SandboxEnvironment(abc.ABC):
             decoding the command output.
           PermissionError: If the user does not have
             permission to execute the command.
+          OutputLimitExceededError: If an output stream
+            exceeds the 1 MiB limit.
         """
         ...
 
@@ -160,6 +203,8 @@ class SandboxEnvironment(abc.ABC):
     async def read_file(self, file: str, text: bool = True) -> Union[str | bytes]:
         """Read a file from the sandbox environment.
 
+        File size is limited to 100 MiB.
+
         Args:
           file (str): Path to file (relative file paths will resolve to the
             per-sample working directory).
@@ -176,8 +221,13 @@ class SandboxEnvironment(abc.ABC):
           PermissionError: If the user does not have
             permission to read from the specified path.
           IsADirectoryError: If the file is a directory.
+          OutputLimitExceededError: If the file size
+            exceeds the 100 MiB limit.
         """
         ...
+
+    async def connection(self) -> SandboxConnection:
+        raise NotImplementedError("connection not implemented")
 
 
 @dataclass

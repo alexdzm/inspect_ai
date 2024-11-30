@@ -11,6 +11,7 @@ from inspect_ai._util.constants import LOG_SCHEMA_VERSION
 from inspect_ai._util.content import ContentImage, ContentText
 from inspect_ai._util.error import EvalError
 from inspect_ai._util.file import dirname, file
+from inspect_ai._util.json import jsonable_python
 from inspect_ai.model._chat_message import ChatMessage
 from inspect_ai.scorer._metric import Score
 
@@ -33,6 +34,8 @@ class SampleSummary(BaseModel):
     input: str | list[ChatMessage]
     target: str | list[str]
     scores: dict[str, Score] | None
+    error: str | None
+    limit: str | None
 
 
 class LogStart(BaseModel):
@@ -191,7 +194,7 @@ class EvalRecorder(FileRecorder):
     def read_log(cls, location: str, header_only: bool = False) -> EvalLog:
         with file(location, "rb") as z:
             with ZipFile(z, mode="r") as zip:
-                evalLog = _read_header(zip)
+                evalLog = _read_header(zip, location)
                 if REDUCTIONS_JSON in zip.namelist():
                     with zip.open(REDUCTIONS_JSON, "r") as f:
                         reductions = [
@@ -221,8 +224,13 @@ class EvalRecorder(FileRecorder):
     ) -> EvalSample:
         with file(location, "rb") as z:
             with ZipFile(z, mode="r") as zip:
-                with zip.open(_sample_filename(id, epoch), "r") as f:
-                    return EvalSample(**json.load(f))
+                try:
+                    with zip.open(_sample_filename(id, epoch), "r") as f:
+                        return EvalSample(**json.load(f))
+                except KeyError:
+                    raise IndexError(
+                        f"Sample id {id} for epoch {epoch} not found in log {location}"
+                    )
 
     @classmethod
     @override
@@ -261,6 +269,8 @@ class EvalRecorder(FileRecorder):
                     input=text_inputs(sample.input),
                     target=sample.target,
                     scores=sample.scores,
+                    error=sample.error.message if sample.error is not None else None,
+                    limit=f"{sample.limit.type}" if sample.limit is not None else None,
                 )
             )
         log.samples.clear()
@@ -277,7 +287,12 @@ class EvalRecorder(FileRecorder):
 def zip_write(zip: ZipFile, filename: str, data: Any) -> None:
     zip.writestr(
         filename,
-        to_json(value=data, indent=2, exclude_none=True, fallback=lambda _x: None),
+        to_json(
+            value=jsonable_python(data),
+            indent=2,
+            exclude_none=True,
+            fallback=lambda _x: None,
+        ),
     )
 
 
@@ -390,18 +405,18 @@ def _read_all_summaries(zip: ZipFile, count: int) -> list[SampleSummary]:
         return summaries
 
 
-def _read_header(zip: ZipFile) -> EvalLog:
+def _read_header(zip: ZipFile, location: str) -> EvalLog:
     # first see if the header is here
     if HEADER_JSON in zip.namelist():
         with zip.open(HEADER_JSON, "r") as f:
-            return EvalLog(**json.load(f))
+            log = EvalLog(**json.load(f))
+            log.location = location
+            return log
     else:
         with zip.open(_journal_path(START_JSON), "r") as f:
             start = LogStart(**json.load(f))
         return EvalLog(
-            version=start.version,
-            eval=start.eval,
-            plan=start.plan,
+            version=start.version, eval=start.eval, plan=start.plan, location=location
         )
 
 

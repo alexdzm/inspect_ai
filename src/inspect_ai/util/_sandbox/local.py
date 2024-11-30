@@ -7,7 +7,8 @@ import aiofiles
 from typing_extensions import override
 
 from .._subprocess import ExecResult, subprocess
-from .environment import SandboxEnvironment
+from .environment import SandboxConnection, SandboxConnectionLocal, SandboxEnvironment
+from .limits import verify_exec_result_size, verify_read_file_size
 from .registry import sandboxenv
 
 
@@ -56,13 +57,15 @@ class LocalSandboxEnvironment(SandboxEnvironment):
         if not final_cwd.is_absolute():
             final_cwd = self.directory.name / final_cwd
 
-        return await subprocess(
+        result = await subprocess(
             args=cmd,
             input=input,
             cwd=final_cwd,
             env=env,
             timeout=timeout,
         )
+        verify_exec_result_size(result)
+        return result
 
     @override
     async def write_file(self, file: str, contents: str | bytes) -> None:
@@ -86,12 +89,19 @@ class LocalSandboxEnvironment(SandboxEnvironment):
     @override
     async def read_file(self, file: str, text: bool = True) -> Union[str | bytes]:
         file = self._resolve_file(file)
+        verify_read_file_size(file)
         if text:
             async with aiofiles.open(file, "r", encoding="utf-8") as f:
                 return await f.read()
         else:
             async with aiofiles.open(file, "rb") as f:
                 return await f.read()
+
+    @override
+    async def connection(self) -> SandboxConnection:
+        return SandboxConnectionLocal(
+            command="/bin/bash --login", working_dir=self.directory.name
+        )
 
     def _resolve_file(self, file: str) -> str:
         path = Path(file)

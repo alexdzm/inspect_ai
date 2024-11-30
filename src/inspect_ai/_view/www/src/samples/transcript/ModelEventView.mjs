@@ -14,7 +14,7 @@ import { ApplicationIcons } from "../../appearance/Icons.mjs";
 import { MetaDataGrid } from "../../components/MetaDataGrid.mjs";
 import { FontSize, TextStyle } from "../../appearance/Fonts.mjs";
 import { ModelUsagePanel } from "../../usage/UsageCard.mjs";
-import { formatNumber } from "../../utils/Format.mjs";
+import { formatDateTime, formatNumber } from "../../utils/Format.mjs";
 
 /**
  * Renders the StateEventView component.
@@ -49,7 +49,7 @@ export const ModelEventView = ({ id, event, style }) => {
   // For any user messages which immediately preceded this model call, including a
   // panel and display those user messages
   const userMessages = [];
-  for (const msg of event.input.reverse()) {
+  for (const msg of event.input.slice().reverse()) {
     if (msg.role === "user") {
       userMessages.push(msg);
     } else {
@@ -58,7 +58,7 @@ export const ModelEventView = ({ id, event, style }) => {
   }
 
   return html`
-  <${EventPanel} id=${id} title="Model Call: ${event.model} ${subtitle}" icon=${ApplicationIcons.model} style=${style}>
+  <${EventPanel} id=${id} title="Model Call: ${event.model} ${subtitle}"  subTitle=${formatDateTime(new Date(event.timestamp))} icon=${ApplicationIcons.model} style=${style}>
   
     <div name="Summary" style=${{ margin: "0.5em 0" }}>
     <${ChatView}
@@ -66,6 +66,7 @@ export const ModelEventView = ({ id, event, style }) => {
       messages=${[...userMessages, ...(outputMessages || [])]}
       style=${{ paddingTop: "1em" }}
       numbered=${false}
+      toolCallStyle="compact"
       />
     </div>
 

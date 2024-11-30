@@ -30,6 +30,7 @@ from inspect_ai.tool._tool_call import ToolCallContent, ToolCallError
 from inspect_ai.tool._tool_def import ToolDef, tool_defs
 from inspect_ai.tool._tool_info import parse_docstring
 from inspect_ai.tool._tool_params import ToolParams
+from inspect_ai.util import OutputLimitExceededError
 
 from ._chat_message import ChatMessageAssistant, ChatMessageTool
 from ._generate_config import active_generate_config
@@ -67,6 +68,10 @@ async def call_tools(
             # create a transript for this call
             init_transcript(Transcript(name=call.function))
 
+            # Amend the tool call with a custom view
+            view = tool_call_view(call, tdefs)
+            call.view = view
+
             result: Any = ""
             tool_error: ToolCallError | None = None
             try:
@@ -96,6 +101,12 @@ async def call_tools(
                 if isinstance(ex.filename, str):
                     err = f"{err} Filename '{ex.filename}'."
                 tool_error = ToolCallError("is_a_directory", err)
+            except OutputLimitExceededError as ex:
+                tool_error = ToolCallError(
+                    "output_limit",
+                    f"The tool output limit of {ex.limit_str} was exceeded.",
+                )
+                result = ex.truncated_output or ""
             except ToolParsingError as ex:
                 tool_error = ToolCallError("parsing", ex.message)
             except ToolApprovalError as ex:
@@ -131,9 +142,9 @@ async def call_tools(
                 arguments=call.arguments,
                 result=content,
                 truncated=truncated,
-                view=tool_call_view(call, tdefs),
+                view=view,
                 error=tool_error,
-                events=transcript().events,
+                events=list(transcript().events),
             )
 
             # return message and event
@@ -144,23 +155,37 @@ async def call_tools(
                 error=tool_error,
             ), event
 
-        # call tools in parallel unless disabled by one of the tools
-        if disable_parallel_tools(tdefs):
-            results: list[tuple[ChatMessageTool, ToolEvent]] = []
-            for call in message.tool_calls:
-                task = asyncio.create_task(call_tool_task(call))
-                results.append(await task)
-        else:
-            tasks = [call_tool_task(call) for call in message.tool_calls]
-            results = await asyncio.gather(*tasks)
-
-        # trace and fire tool events for each result
-        for tool_message, event in [result for result in results]:
-            trace_tool_mesage(tool_message)
+        # call tools
+        tool_messages: list[ChatMessageTool] = []
+        for call in message.tool_calls:
+            # create pending tool event and add it to the transcript
+            event = ToolEvent(
+                id=call.id,
+                function=call.function,
+                arguments=call.arguments,
+                view=tool_call_view(call, tdefs),
+                pending=True,
+            )
             transcript()._event(event)
 
+            # execute the tool call
+            task = asyncio.create_task(call_tool_task(call))
+            tool_message, result_event = await task
+            tool_messages.append(tool_message)
+
+            # trace if we are tracing
+            trace_tool_mesage(tool_message)
+
+            # update the event with the results
+            event.set_result(
+                result=result_event.result,
+                truncated=result_event.truncated,
+                error=result_event.error,
+                events=result_event.events,
+            )
+
         # return tool messages
-        return [result[0] for result in results]
+        return tool_messages
 
     else:
         return []
