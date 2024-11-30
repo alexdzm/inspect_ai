@@ -100,6 +100,8 @@ def read_messages(messages: list[dict[str, Any]]) -> list[ChatMessage]:
     chat_messages: list[ChatMessage] = []
     for message in messages:
         role = message.get("role", None)
+        if role is None:
+            role = message.get("type", None)
 
         content = message.get("content", None)
         if content is None:
@@ -108,7 +110,7 @@ def read_messages(messages: list[dict[str, Any]]) -> list[ChatMessage]:
         match role:
             case "system":
                 chat_messages.append(ChatMessageSystem(content=content, source="input"))
-            case "user":
+            case "user"|"human":
                 chat_messages.append(ChatMessageUser(content=content, source="input"))
             case "assistant":
                 chat_messages.append(
